@@ -105,6 +105,7 @@ extern bool fullPageWrites;
 extern bool wal_log_hints;
 extern bool wal_compression;
 extern bool log_checkpoints;
+extern char *PRAMfileName;
 
 extern int	CheckPointSegments;
 

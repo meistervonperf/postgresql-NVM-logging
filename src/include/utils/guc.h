@@ -431,6 +431,7 @@ extern void assign_search_path(const char *newval, void *extra);
 
 /* in access/transam/xlog.c */
 extern bool check_wal_buffers(int *newval, void **extra, GucSource source);
+extern bool check_wal_pram_file(char **newval, void **extra, GucSource source);
 extern void assign_xlog_sync_method(int new_sync_method, void *extra);
 
 #endif   /* GUC_H */

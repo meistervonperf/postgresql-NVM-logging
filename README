@@ -1,27 +1,14 @@
-PostgreSQL Database Management System
-=====================================
+This is a NVM logging implementation on postgresql-9.6.0.
+The idea and mechanism was presented at PGCon 2016 
+can be found at https://www.pgcon.org/2016/schedule/events/945.en.html.
 
-This directory contains the source code distribution of the PostgreSQL
-database management system.
+To activate the NVM Logging you describe one GUC parameter 
+in postgresql.conf as the following.
+PRAM_FILE_NAME="NVM File name"
 
-PostgreSQL is an advanced object-relational database management system
-that supports an extended subset of the SQL standard, including
-transactions, foreign keys, subqueries, triggers, user-defined types
-and functions.  This distribution also contains C language bindings.
+If you have no NVM (or persistent memory) on your DB server that uses Linux,
+you can examine the NVM logging by using pseudo pram driver that can be
+obtained from https://github.com/meistervonperf/pseudo-pram.
 
-PostgreSQL has many language interfaces, many of which are listed here:
-
-	http://www.postgresql.org/download
-
-See the file INSTALL for instructions on how to build and install
-PostgreSQL.  That file also lists supported operating systems and
-hardware platforms and contains information regarding any other
-software packages that are required to build or run the PostgreSQL
-system.  Copyright and license information can be found in the
-file COPYRIGHT.  A comprehensive documentation set is included in this
-distribution; it can be read as described in the installation
-instructions.
-
-The latest version of this software may be obtained at
-http://www.postgresql.org/download/.  For more information look at our
-web site located at http://www.postgresql.org/.
+cf. Original README file in the postgresql-9.6.0 directory is renamed 
+   to README-original.

@@ -72,6 +72,7 @@
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 #include "pg_trace.h"
+#include "pram.h"
 
 extern uint32 bootstrap_data_checksum_version;
 
@@ -777,6 +778,18 @@ static bool InRedo = false;
 /* Have we launched bgwriter during recovery? */
 static bool bgwriterLaunched = false;
 
+/********/
+#define PRAM_DUMMY_FD INT32_MAX
+#define pramSize (((Size) XLOG_BLCKSZ * XLOGbuffers) / XLogSegSize)
+
+char	*PRAMfileName = NULL;	/* a GUC parameter */
+
+static bool usePram = false;
+static int	pramFd = -1;
+static XLogSegNo Pram_minSegNo, Pram_maxSegNo;
+static int Pram_minIndex;
+/********/
+
 /* For WALInsertLockAcquire/Release functions */
 static int	MyLockNo = 0;
 static bool holdingAllLocks = false;
@@ -1267,6 +1280,7 @@ CopyXLogRecordToWAL(int write_len, bool isLogSwitch, XLogRecData *rdata,
 	int			written;
 	XLogRecPtr	CurrPos;
 	XLogPageHeader pagehdr;
+	uint32		*markerpos, marker;
 
 	/*
 	 * Get a pointer to the right place in the right WAL buffer to start
@@ -1281,6 +1295,12 @@ CopyXLogRecordToWAL(int write_len, bool isLogSwitch, XLogRecData *rdata,
 	 * on this page.
 	 */
 	Assert(freespace >= sizeof(uint32));
+
+	marker = *((uint32 *) rdata->data);
+	markerpos = (uint32 *) currpos;
+	if (usePram) {
+		*((uint32 *) rdata->data) = 0;
+	}
 
 	/* Copy record data */
 	written = 0;
@@ -1373,6 +1393,11 @@ CopyXLogRecordToWAL(int write_len, bool isLogSwitch, XLogRecData *rdata,
 	{
 		/* Align the end position, so that the next record starts aligned */
 		CurrPos = MAXALIGN64(CurrPos);
+	}
+
+	if (usePram) {
+		pg_memory_barrier();
+		*markerpos = marker;
 	}
 
 	if (CurrPos != EndPos)
@@ -1864,7 +1889,11 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, bool opportunistic)
 	XLogPageHeader NewPage;
 	int			npages = 0;
 
-	LWLockAcquire(WALBufMappingLock, LW_EXCLUSIVE);
+	if (opportunistic) {
+		if (!LWLockConditionalAcquire(WALBufMappingLock, LW_EXCLUSIVE)) return;
+	} else {
+		LWLockAcquire(WALBufMappingLock, LW_EXCLUSIVE);
+	}
 
 	/*
 	 * Now that we have the lock, check if someone initialized the page
@@ -1872,14 +1901,20 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, bool opportunistic)
 	 */
 	while (upto >= XLogCtl->InitializedUpTo || opportunistic)
 	{
+		int			flushidx;
+
+		if (usePram)
+			if (opportunistic &&
+				(XLogCtl->LogwrtResult.Write + ((pramSize-1) * XLOG_SEG_SIZE - XLOG_BLCKSZ)) <= XLogCtl->InitializedUpTo) break;
 		nextidx = XLogRecPtrToBufIdx(XLogCtl->InitializedUpTo);
+		flushidx = usePram ? XLogRecPtrToBufIdx(upto - ((pramSize-1) * XLOG_SEG_SIZE - XLOG_BLCKSZ)) : nextidx;
 
 		/*
 		 * Get ending-offset of the buffer page we need to replace (this may
 		 * be zero if the buffer hasn't been used yet).  Fall through if it's
 		 * already written out.
 		 */
-		OldPageRqstPtr = XLogCtl->xlblocks[nextidx];
+		OldPageRqstPtr = XLogCtl->xlblocks[flushidx];
 		if (LogwrtResult.Write < OldPageRqstPtr)
 		{
 			/*
@@ -2003,6 +2038,20 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, bool opportunistic)
 		*((volatile XLogRecPtr *) &XLogCtl->xlblocks[nextidx]) = NewPageEndPtr;
 
 		XLogCtl->InitializedUpTo = NewPageEndPtr;
+
+		if (usePram)
+		{
+			XLogRecPtr LogwrtResultWrite = XLogCtl->LogwrtResult.Write;
+
+			if (LogwrtResultWrite != 0 &&
+				LogwrtResultWrite + XLOG_SEG_SIZE * (pramSize - 1) < NewPageBeginPtr)
+			{
+				elog(PANIC,"%d: LogwrtResultWrite(%lx) InitializedUpTo=NewPageEndPtr(%lx) xblk(%lx-%lx-%lx) nextidx(%x) flushidx(%x)", __LINE__,
+					 LogwrtResultWrite, NewPageEndPtr,
+					 XLogCtl->xlblocks[nextidx-1], XLogCtl->xlblocks[nextidx], XLogCtl->xlblocks[nextidx+1],
+					 nextidx, flushidx);
+			}
+		}
 
 		npages++;
 	}
@@ -2581,6 +2630,17 @@ XLogFlush(XLogRecPtr record)
 	if (!XLogInsertAllowed())
 	{
 		UpdateMinRecoveryPoint(record, false);
+		return;
+	}
+
+	/*
+	 * When we use PRAM for the WAL buffer, XLogRecords in it is persistent,
+	 * thus it is unnecessary to flush log records to the disk.
+	 */
+	if (usePram)
+	{
+		XLogSetAsyncXactLSN(record);
+		WaitXLogInsertionsToFinish(record);
 		return;
 	}
 
@@ -3395,7 +3455,10 @@ XLogFileRead(XLogSegNo segno, int emode, TimeLineID tli,
 		snprintf(path, MAXPGPATH, XLOGDIR "/%s", xlogfname);
 	}
 
-	fd = BasicOpenFile(path, O_RDONLY | PG_BINARY, 0);
+	if (source == XLOG_FROM_PG_XLOG && Pram_minSegNo <= segno && segno < Pram_maxSegNo)
+		fd = PRAM_DUMMY_FD;
+	else
+		fd = BasicOpenFile(path, O_RDONLY | PG_BINARY, 0);
 	if (fd >= 0)
 	{
 		/* Success! */
@@ -3973,7 +4036,7 @@ ReadRecord(XLogReaderState *xlogreader, XLogRecPtr RecPtr, int emode,
 		{
 			if (readFile >= 0)
 			{
-				close(readFile);
+				if (readFile != PRAM_DUMMY_FD) close(readFile);
 				readFile = -1;
 			}
 
@@ -4600,6 +4663,13 @@ check_wal_buffers(int *newval, void **extra, GucSource source)
 	return true;
 }
 
+bool
+check_wal_pram_file(char **newval, void **extra, GucSource source)
+{
+	if (**newval != '\0') usePram = true;
+	return true;
+}
+
 /*
  * Initialization of shared memory for XLOG
  */
@@ -4634,6 +4704,12 @@ XLOGShmemSize(void)
 	size = add_size(size, XLOG_BLCKSZ);
 	/* and the buffers themselves */
 	size = add_size(size, mul_size(XLOG_BLCKSZ, XLOGbuffers));
+	if (!usePram) {
+		/* extra alignment padding for XLOG I/O buffers */
+		size = add_size(size, XLOG_BLCKSZ);
+		/* and the buffers themselves */
+		size = add_size(size, mul_size(XLOG_BLCKSZ, XLOGbuffers));
+	}
 
 	/*
 	 * Note: we don't count ControlFileData, it comes out of the "slop factor"
@@ -4720,9 +4796,18 @@ XLOGShmemInit(void)
 	 * This simplifies some calculations in XLOG insertion. It is also
 	 * required for O_DIRECT.
 	 */
-	allocptr = (char *) TYPEALIGN(XLOG_BLCKSZ, allocptr);
-	XLogCtl->pages = allocptr;
-	memset(XLogCtl->pages, 0, (Size) XLOG_BLCKSZ * XLOGbuffers);
+	if (usePram) {
+		if (pramFd == -1) {
+			pramFd = pram_open(PRAMfileName);
+			if (pramFd < 0) elog(PANIC, "pram_open(\"%s\") failed.", PRAMfileName);
+		}
+		XLogCtl->pages = pram_mmap(pramSize * XLogSegSize, pramFd);
+		if (XLogCtl->pages == MAP_FAILED) elog(PANIC, "pram_mmap(0x%lx, %d) failed.", pramSize * XLogSegSize, pramFd);
+	} else {
+		allocptr = (char *) TYPEALIGN(XLOG_BLCKSZ, allocptr);
+		XLogCtl->pages = allocptr;
+		memset(XLogCtl->pages, 0, (Size) XLOG_BLCKSZ * XLOGbuffers);
+	}
 
 	/*
 	 * Do basic initialization of XLogCtl shared data. (StartupXLOG will fill
@@ -5262,7 +5347,7 @@ exitArchiveRecovery(TimeLineID endTLI, XLogRecPtr endOfLog)
 	 */
 	if (readFile >= 0)
 	{
-		close(readFile);
+		if (readFile != PRAM_DUMMY_FD) close(readFile);
 		readFile = -1;
 	}
 
@@ -5916,6 +6001,57 @@ CheckRequiredParameterValues(void)
 	}
 }
 
+static bool
+parsePramBuffer(uint64 system_identifier)
+{
+	XLogLongPageHeaderData *pageHdr;
+	XLogSegNo Pram_SegNo;
+	bool pramValid = false;
+	int i;
+
+	for (i = 0; i < pramSize; i++)
+	{
+		pageHdr = (XLogLongPageHeaderData *) &XLogCtl->pages[i * (Size) XLOG_SEG_SIZE];
+		if (pageHdr->xlp_sysid != system_identifier) continue;
+
+		XLByteToSeg(pageHdr->std.xlp_pageaddr, Pram_SegNo);
+		if (Pram_minSegNo == 0 || Pram_minSegNo > Pram_SegNo) {
+			Pram_minSegNo = Pram_SegNo;
+			Pram_minIndex = i;
+			pramValid = true;
+		}
+		if (Pram_maxSegNo == 0 || Pram_maxSegNo <= Pram_SegNo)
+			Pram_maxSegNo = Pram_SegNo + 1;
+	}
+
+/*
+ * Verify the XLogRecords in the Pram
+ */
+	if (pramValid)
+	{
+		int index;
+
+		for (i = 0, index = Pram_minIndex; i < pramSize; i++)
+		{
+			pageHdr = (XLogLongPageHeaderData *) &XLogCtl->pages[index * (Size) XLOG_SEG_SIZE];
+			if (pageHdr->xlp_sysid != system_identifier) break;
+
+			XLByteToSeg(pageHdr->std.xlp_pageaddr, Pram_SegNo);
+			if ((Pram_SegNo + 1) == Pram_maxSegNo) {
+				elog(LOG, "%s: Pram contains valid XLogSegment from %lx to %lx.", __func__,
+					 Pram_minSegNo * XLogSegSize, (Pram_maxSegNo - 1) * XLogSegSize);
+				return true;
+			}
+			if (Pram_SegNo != (Pram_minSegNo + i)) break;
+
+			if (++index >= pramSize) index -= pramSize; 
+		}
+		elog(PANIC, "%s: Pram has inconsistent XLogRecords.", __func__);
+	}
+	elog(LOG, "%s: Pram does not contain valid XLogRecords.", __func__);
+	return false;
+}
+
 /*
  * This must be called ONCE during postmaster or standalone-backend startup
  */
@@ -5941,6 +6077,7 @@ StartupXLOG(void)
 	XLogReaderState *xlogreader;
 	XLogPageReadPrivate private;
 	bool		fast_promoted = false;
+	bool		pramValid = false;
 	struct stat st;
 
 	/*
@@ -6079,6 +6216,7 @@ StartupXLOG(void)
 				 errmsg("out of memory"),
 		   errdetail("Failed while allocating an XLog reading processor.")));
 	xlogreader->system_identifier = ControlFile->system_identifier;
+	if (usePram) pramValid = parsePramBuffer(ControlFile->system_identifier);
 
 	if (read_backup_label(&checkPointLoc, &backupEndRequired,
 						  &backupFromStandby))
@@ -7159,6 +7297,28 @@ StartupXLOG(void)
 	Insert->PrevBytePos = XLogRecPtrToBytePos(LastRec);
 	Insert->CurrBytePos = XLogRecPtrToBytePos(EndOfLog);
 
+	if (usePram && !pramValid) {
+		XLogRecPtr BeginOfSegment = EndOfLog - (EndOfLog % XLOG_SEG_SIZE);
+		int		firstIdx, idx;
+
+		elog(LOG, "%s: fills the Pram_buffer up with valid WAL. "
+			 "BeginOfSegment(%lx) ControlFile->system_identifier(%lx)",
+			 __func__,
+			 BeginOfSegment, ControlFile->system_identifier);
+
+		firstIdx = XLogRecPtrToBufIdx(BeginOfSegment);
+		for (idx = firstIdx; idx != XLogRecPtrToBufIdx(EndOfLog); idx++)
+		{
+			if (XLogPageRead(xlogreader, BeginOfSegment + (idx-firstIdx) * XLOG_BLCKSZ, XLOG_BLCKSZ,
+							 xlogreader->currRecPtr, xlogreader->readBuf, &xlogreader->readPageTLI) != XLOG_BLCKSZ)
+				elog(PANIC,"%d: cannot read WAL block at %lx", __LINE__, BeginOfSegment + (idx-firstIdx) * XLOG_BLCKSZ);
+			memcpy(&XLogCtl->pages[idx * (Size) XLOG_BLCKSZ], xlogreader->readBuf, XLOG_BLCKSZ);
+		}
+		if (XLogPageRead(xlogreader, BeginOfSegment + (idx-firstIdx) * XLOG_BLCKSZ, XLOG_BLCKSZ,
+						 xlogreader->currRecPtr, xlogreader->readBuf, &xlogreader->readPageTLI) != XLOG_BLCKSZ)
+			elog(PANIC,"%d: cannot read WAL block at %lx", __LINE__, BeginOfSegment + (idx-firstIdx) * XLOG_BLCKSZ);
+	}
+
 	/*
 	 * Tricky point here: readBuf contains the *last* block that the LastRec
 	 * record spans, not the one it starts in.  The last block is indeed the
@@ -7405,7 +7565,7 @@ StartupXLOG(void)
 	/* Shut down xlogreader */
 	if (readFile >= 0)
 	{
-		close(readFile);
+		if (readFile != PRAM_DUMMY_FD) close(readFile);
 		readFile = -1;
 	}
 	XLogReaderFree(xlogreader);
@@ -11010,7 +11170,7 @@ XLogPageRead(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int reqLen,
 			}
 		}
 
-		close(readFile);
+		if (readFile != PRAM_DUMMY_FD) close(readFile);
 		readFile = -1;
 		readSource = 0;
 	}
@@ -11060,6 +11220,8 @@ retry:
 	else
 		readLen = XLOG_BLCKSZ;
 
+	if (readFile != PRAM_DUMMY_FD)
+	{
 	/* Read the requested page */
 	readOff = targetPageOff;
 	if (lseek(readFile, (off_t) readOff, SEEK_SET) < 0)
@@ -11085,6 +11247,15 @@ retry:
 						fname, readOff)));
 		goto next_record_is_invalid;
 	}
+	} else {
+		int index = Pram_minIndex + (readSegNo - Pram_minSegNo);
+
+		/* Read the requested page */
+		readOff = targetPageOff;
+
+		if (index >= pramSize) index -= pramSize;
+		memcpy(readBuf, &XLogCtl->pages[index * (Size) XLOG_SEG_SIZE + readOff], XLOG_BLCKSZ);
+	}
 
 	Assert(targetSegNo == readSegNo);
 	Assert(targetPageOff == readOff);
@@ -11097,7 +11268,7 @@ next_record_is_invalid:
 	lastSourceFailed = true;
 
 	if (readFile >= 0)
-		close(readFile);
+		if (readFile != PRAM_DUMMY_FD) close(readFile);
 	readFile = -1;
 	readLen = 0;
 	readSource = 0;
@@ -11347,7 +11518,7 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 				/* Close any old file we might have open. */
 				if (readFile >= 0)
 				{
-					close(readFile);
+					if (readFile != PRAM_DUMMY_FD) close(readFile);
 					readFile = -1;
 				}
 				/* Reset curFileTLI if random fetch. */

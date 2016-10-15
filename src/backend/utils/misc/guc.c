@@ -3554,6 +3554,16 @@ static struct config_string ConfigureNamesString[] =
 		check_cluster_name, NULL, NULL
 	},
 
+	{
+		{"wal_pram_file", PGC_POSTMASTER, WAL_SETTINGS,
+			gettext_noop("Sets the pram file name when pram is used for wal buffer."),
+			NULL
+		},
+		&PRAMfileName,
+		"",
+		check_wal_pram_file, NULL, NULL
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, NULL, NULL, NULL, NULL
