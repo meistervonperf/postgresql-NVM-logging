@@ -4,7 +4,9 @@ can be found at https://www.pgcon.org/2016/schedule/events/945.en.html.
 
 To activate the NVM Logging you describe one GUC parameter 
 in postgresql.conf as the following.
-PRAM_FILE_NAME="NVM File name"
+wal_pram_file = 'NVM File name'
+Also wal buffer size, specified by 'wal_buffers', should be an integer multiple 
+of 16MB and equal to or larger than 48MB (64MB or more is recommended).
 
 If you have no NVM (or persistent memory) on your DB server that uses Linux,
 you can examine the NVM logging by using pseudo pram driver that can be
