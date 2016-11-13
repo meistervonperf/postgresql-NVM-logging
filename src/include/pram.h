@@ -19,7 +19,7 @@
 static inline int
 pram_open(char *fileName)
 {
-	return BasicOpenFile(fileName, O_RDWR | PG_BINARY | O_CREAT,
+	return BasicOpenFile(fileName, O_RDWR | PG_BINARY,
 						 S_IRUSR | S_IWUSR);
 }
 
