@@ -4797,6 +4797,13 @@ XLOGShmemInit(void)
 	 * required for O_DIRECT.
 	 */
 	if (usePram) {
+		if (pramSize < 3) elog(PANIC, "'wal_buffers' should be equal to or larger than 48MB when NVM logging is activated.");
+		if (XLOGbuffers != (pramSize * (XLogSegSize / XLOG_BLCKSZ))) {
+			int oldXLOGbuffers = XLOGbuffers;
+			XLOGbuffers = (pramSize * XLogSegSize) / (Size) XLOG_BLCKSZ;
+			elog(LOG, "'wal_buffers' has been changed from %dMB to %dMB.",
+				 oldXLOGbuffers / ((1024*1024)/XLOG_BLCKSZ), XLOGbuffers / ((1024*1024)/XLOG_BLCKSZ));
+		}
 		if (pramFd == -1) {
 			pramFd = pram_open(PRAMfileName);
 			if (pramFd < 0) elog(PANIC, "pram_open(\"%s\") failed.", PRAMfileName);
