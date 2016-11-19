@@ -2615,7 +2615,7 @@ UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force)
  * already held, and we try to avoid acquiring it if possible.
  */
 void
-XLogFlush(XLogRecPtr record)
+XLogFlush_internal(XLogRecPtr record, bool beyondNVM)
 {
 	XLogRecPtr	WriteRqstPtr;
 	XLogwrtRqst WriteRqst;
@@ -2637,7 +2637,7 @@ XLogFlush(XLogRecPtr record)
 	 * When we use PRAM for the WAL buffer, XLogRecords in it is persistent,
 	 * thus it is unnecessary to flush log records to the disk.
 	 */
-	if (usePram)
+	if (usePram && !beyondNVM)
 	{
 		XLogSetAsyncXactLSN(record);
 		WaitXLogInsertionsToFinish(record);
@@ -8626,7 +8626,7 @@ CreateCheckPoint(int flags)
 						shutdown ? XLOG_CHECKPOINT_SHUTDOWN :
 						XLOG_CHECKPOINT_ONLINE);
 
-	XLogFlush(recptr);
+	XLogFlush_internal(recptr, shutdown);
 
 	/*
 	 * We mustn't write any new WAL after a shutdown checkpoint, or it will be
