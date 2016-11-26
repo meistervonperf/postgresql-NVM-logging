@@ -879,6 +879,7 @@ static void WALInsertLockAcquire(void);
 static void WALInsertLockAcquireExclusive(void);
 static void WALInsertLockRelease(void);
 static void WALInsertLockUpdateInsertingAt(XLogRecPtr insertingAt);
+static void XLogFlush_internal(XLogRecPtr record);
 
 /*
  * Insert an XLOG record represented by an already-constructed chain of data
@@ -2609,40 +2610,17 @@ UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force)
 }
 
 /*
- * Ensure that all XLOG data through the given position is flushed to disk.
+ * Actual procedure to ensure that all XLOG data through the given position
+ * is flushed to disk.
  *
  * NOTE: this differs from XLogWrite mainly in that the WALWriteLock is not
  * already held, and we try to avoid acquiring it if possible.
  */
-void
-XLogFlush_internal(XLogRecPtr record, bool beyondNVM)
+static void
+XLogFlush_internal(XLogRecPtr record)
 {
 	XLogRecPtr	WriteRqstPtr;
 	XLogwrtRqst WriteRqst;
-
-	/*
-	 * During REDO, we are reading not writing WAL.  Therefore, instead of
-	 * trying to flush the WAL, we should update minRecoveryPoint instead. We
-	 * test XLogInsertAllowed(), not InRecovery, because we need checkpointer
-	 * to act this way too, and because when it tries to write the
-	 * end-of-recovery checkpoint, it should indeed flush.
-	 */
-	if (!XLogInsertAllowed())
-	{
-		UpdateMinRecoveryPoint(record, false);
-		return;
-	}
-
-	/*
-	 * When we use PRAM for the WAL buffer, XLogRecords in it is persistent,
-	 * thus it is unnecessary to flush log records to the disk.
-	 */
-	if (usePram && !beyondNVM)
-	{
-		XLogSetAsyncXactLSN(record);
-		WaitXLogInsertionsToFinish(record);
-		return;
-	}
 
 	/* Quick exit if already known flushed */
 	if (record <= LogwrtResult.Flush)
@@ -2788,6 +2766,40 @@ XLogFlush_internal(XLogRecPtr record, bool beyondNVM)
 		"xlog flush request %X/%X is not satisfied --- flushed only to %X/%X",
 			 (uint32) (record >> 32), (uint32) record,
 		   (uint32) (LogwrtResult.Flush >> 32), (uint32) LogwrtResult.Flush);
+}
+
+/*
+ * Interface for XLogFlush_internal() that all XLOG data through the given 
+ * position is flushed to disk.
+ */
+void
+XLogFlush(XLogRecPtr record)
+{
+	/*
+	 * During REDO, we are reading not writing WAL.  Therefore, instead of
+	 * trying to flush the WAL, we should update minRecoveryPoint instead. We
+	 * test XLogInsertAllowed(), not InRecovery, because we need checkpointer
+	 * to act this way too, and because when it tries to write the
+	 * end-of-recovery checkpoint, it should indeed flush.
+	 */
+	if (!XLogInsertAllowed())
+	{
+		UpdateMinRecoveryPoint(record, false);
+		return;
+	}
+
+	/*
+	 * When we use PRAM for the WAL buffer, XLogRecords in it is persistent,
+	 * thus it is unnecessary to flush log records to the disk.
+	 */
+	if (usePram)
+	{
+		XLogSetAsyncXactLSN(record);
+		WaitXLogInsertionsToFinish(record);
+		return;
+	}
+
+	XLogFlush_internal(record);
 }
 
 /*
@@ -8626,7 +8638,7 @@ CreateCheckPoint(int flags)
 						shutdown ? XLOG_CHECKPOINT_SHUTDOWN :
 						XLOG_CHECKPOINT_ONLINE);
 
-	XLogFlush_internal(recptr, shutdown);
+	XLogFlush_internal(recptr);
 
 	/*
 	 * We mustn't write any new WAL after a shutdown checkpoint, or it will be
