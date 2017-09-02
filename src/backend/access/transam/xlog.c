@@ -4700,10 +4700,6 @@ XLOGShmemSize(void)
 	size = add_size(size, mul_size(sizeof(WALInsertLockPadded), NUM_XLOGINSERT_LOCKS + 1));
 	/* xlblocks array */
 	size = add_size(size, mul_size(sizeof(XLogRecPtr), XLOGbuffers));
-	/* extra alignment padding for XLOG I/O buffers */
-	size = add_size(size, XLOG_BLCKSZ);
-	/* and the buffers themselves */
-	size = add_size(size, mul_size(XLOG_BLCKSZ, XLOGbuffers));
 	if (!usePram) {
 		/* extra alignment padding for XLOG I/O buffers */
 		size = add_size(size, XLOG_BLCKSZ);
